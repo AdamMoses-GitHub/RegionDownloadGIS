@@ -1,0 +1,53 @@
+{
+  "name": "Test Project",
+  "bbox": {
+    "min_lon": -74.0,
+    "min_lat": 40.0,
+    "max_lon": -73.0,
+    "max_lat": 41.0,
+    "utm_zone_override": null
+  },
+  "layers": {
+    "terrain": {
+      "enabled": true,
+      "terrain_source": "3dep",
+      "building_source": "merged",
+      "building_height_mode": "estimate",
+      "landuse_raster": true,
+      "landuse_vector": true,
+      "reference_zoom": null
+    },
+    "buildings": {
+      "enabled": true,
+      "terrain_source": "3dep",
+      "building_source": "merged",
+      "building_height_mode": "estimate",
+      "landuse_raster": true,
+      "landuse_vector": true,
+      "reference_zoom": null
+    },
+    "landuse": {
+      "enabled": true,
+      "terrain_source": "3dep",
+      "building_source": "merged",
+      "building_height_mode": "estimate",
+      "landuse_raster": true,
+      "landuse_vector": true,
+      "reference_zoom": null
+    },
+    "reference": {
+      "enabled": true,
+      "terrain_source": "3dep",
+      "building_source": "merged",
+      "building_height_mode": "estimate",
+      "landuse_raster": true,
+      "landuse_vector": true,
+      "reference_zoom": null
+    }
+  },
+  "output_folder": "",
+  "resolution_m": 5.0,
+  "utm_zone_override": null,
+  "created_timestamp": "",
+  "modified_timestamp": "2026-06-18T08:50:07.401784"
+}
