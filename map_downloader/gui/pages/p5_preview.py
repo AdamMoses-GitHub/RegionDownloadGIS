@@ -7,7 +7,7 @@ import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
-from rasterio.transform import Affine
+from rasterio.transform import Affine, from_bounds
 from PySide6.QtWidgets import (
     QWizardPage, QVBoxLayout, QHBoxLayout, QLabel, QTabWidget,
     QWidget, QCheckBox, QTextEdit, QComboBox
@@ -144,17 +144,53 @@ class PreviewPage(QWizardPage):
             return
 
         preview_file = self._choose_preview_raster(processed)
+        landuse_overlay = processed / "landuse.geojson" if self.landuse_check.isChecked() else None
+        buildings_overlay = processed / "buildings.geojson" if self.buildings_check.isChecked() else None
+        water_overlay = processed / "water.geojson" if self.water_check.isChecked() else None
+        big_streets_overlay = processed / "big_streets.geojson" if self.big_streets_check.isChecked() else None
+        small_streets_overlay = processed / "small_streets.geojson" if self.small_streets_check.isChecked() else None
+        target_max_dim = self._target_preview_dim()
+
         if preview_file is None:
-            self.map_label.setText("2D Map Preview\n(no raster layer selected/available)")
-            self.map_label.setPixmap(QPixmap())
+            cache_key = self._preview_cache_key(
+                None,
+                landuse_overlay,
+                buildings_overlay,
+                water_overlay,
+                big_streets_overlay,
+                small_streets_overlay,
+                target_max_dim,
+            )
+            pixmap = self._pixmap_cache.get(cache_key)
+            if pixmap is None:
+                pixmap = self._vector_only_to_pixmap(
+                    landuse_overlay,
+                    buildings_overlay,
+                    water_overlay,
+                    big_streets_overlay,
+                    small_streets_overlay,
+                    target_max_dim,
+                )
+                if pixmap is not None:
+                    self._pixmap_cache[cache_key] = pixmap
+
+            if pixmap is not None:
+                self.map_label.setPixmap(
+                    pixmap.scaled(
+                        self.map_label.width(),
+                        self.map_label.height(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                self.map_label.setText("")
+            else:
+                self.map_label.setText("2D Map Preview\n(no raster or vector layer selected/available)")
+                self.map_label.setPixmap(QPixmap())
         else:
-            buildings_overlay = processed / "buildings.geojson" if self.buildings_check.isChecked() else None
-            water_overlay = processed / "water.geojson" if self.water_check.isChecked() else None
-            big_streets_overlay = processed / "big_streets.geojson" if self.big_streets_check.isChecked() else None
-            small_streets_overlay = processed / "small_streets.geojson" if self.small_streets_check.isChecked() else None
-            target_max_dim = self._target_preview_dim()
             cache_key = self._preview_cache_key(
                 preview_file,
+                landuse_overlay,
                 buildings_overlay,
                 water_overlay,
                 big_streets_overlay,
@@ -165,6 +201,7 @@ class PreviewPage(QWizardPage):
             if pixmap is None:
                 pixmap = self._raster_to_pixmap(
                     preview_file,
+                    landuse_overlay,
                     buildings_overlay,
                     water_overlay,
                     big_streets_overlay,
@@ -216,7 +253,8 @@ class PreviewPage(QWizardPage):
 
     def _preview_cache_key(
         self,
-        raster_path: Path,
+        raster_path: Path | None,
+        landuse_path: Path | None,
         buildings_path: Path | None,
         water_path: Path | None,
         big_streets_path: Path | None,
@@ -224,8 +262,10 @@ class PreviewPage(QWizardPage):
         target_max_dim: int,
     ) -> tuple:
         return (
-            str(raster_path),
+            str(raster_path) if raster_path is not None else "",
             self._mtime_ns(raster_path),
+            str(landuse_path) if landuse_path is not None else "",
+            self._mtime_ns(landuse_path),
             str(buildings_path) if buildings_path is not None else "",
             self._mtime_ns(buildings_path),
             str(water_path) if water_path is not None else "",
@@ -268,6 +308,7 @@ class PreviewPage(QWizardPage):
     def _raster_to_pixmap(
         self,
         raster_path: Path,
+        landuse_path: Path | None = None,
         buildings_path: Path | None = None,
         water_path: Path | None = None,
         big_streets_path: Path | None = None,
@@ -317,6 +358,14 @@ class PreviewPage(QWizardPage):
                         preview_transform,
                     )
 
+                if landuse_path is not None and landuse_path.exists():
+                    self._apply_landuse_overlay(
+                        rgb,
+                        landuse_path,
+                        src.crs,
+                        preview_transform,
+                    )
+
                 if water_path is not None and water_path.exists():
                     self._apply_water_overlay(
                         rgb,
@@ -354,6 +403,217 @@ class PreviewPage(QWizardPage):
                 return QPixmap.fromImage(image.copy())
         except Exception:
             return None
+
+    def _vector_only_to_pixmap(
+        self,
+        landuse_path: Path | None,
+        buildings_path: Path | None,
+        water_path: Path | None,
+        big_streets_path: Path | None,
+        small_streets_path: Path | None,
+        target_max_dim: int,
+    ) -> QPixmap | None:
+        """Render selected vector layers on a neutral background when no raster is available."""
+        layers: list[tuple[str, gpd.GeoDataFrame]] = []
+        crs = None
+
+        for name, path in [
+            ("landuse", landuse_path),
+            ("buildings", buildings_path),
+            ("water", water_path),
+            ("big_streets", big_streets_path),
+            ("small_streets", small_streets_path),
+        ]:
+            if path is None or not path.exists():
+                continue
+            try:
+                gdf = gpd.read_file(path)
+            except Exception:
+                continue
+            if len(gdf) == 0 or "geometry" not in gdf.columns:
+                continue
+            gdf = gdf[gdf.geometry.notna() & (~gdf.geometry.is_empty)].copy()
+            if len(gdf) == 0:
+                continue
+
+            if crs is None:
+                crs = gdf.crs if gdf.crs is not None else "EPSG:4326"
+            if gdf.crs is not None and crs is not None and gdf.crs != crs:
+                gdf = gdf.to_crs(crs)
+
+            layers.append((name, gdf))
+
+        if not layers:
+            return None
+
+        bounds = [gdf.total_bounds for _, gdf in layers]
+        minx = min(b[0] for b in bounds)
+        miny = min(b[1] for b in bounds)
+        maxx = max(b[2] for b in bounds)
+        maxy = max(b[3] for b in bounds)
+        if not np.isfinite([minx, miny, maxx, maxy]).all() or maxx <= minx or maxy <= miny:
+            return None
+
+        pad_x = max((maxx - minx) * 0.05, 1e-6)
+        pad_y = max((maxy - miny) * 0.05, 1e-6)
+        minx -= pad_x
+        maxx += pad_x
+        miny -= pad_y
+        maxy += pad_y
+
+        span_x = maxx - minx
+        span_y = maxy - miny
+        if span_x >= span_y:
+            width = int(target_max_dim)
+            height = max(256, int(round(target_max_dim * (span_y / span_x))))
+        else:
+            height = int(target_max_dim)
+            width = max(256, int(round(target_max_dim * (span_x / span_y))))
+
+        rgb = np.full((height, width, 3), 242, dtype=np.uint8)
+        transform = from_bounds(minx, miny, maxx, maxy, width, height)
+
+        for name, gdf in layers:
+            if name == "landuse":
+                self._apply_polygon_overlay_from_gdf(
+                    rgb,
+                    gdf,
+                    transform,
+                    fill_color=np.array([125, 180, 95], dtype=np.float32),
+                    alpha=0.28,
+                    edge_color=np.array([85, 140, 60], dtype=np.float32),
+                )
+            elif name == "buildings":
+                self._apply_polygon_overlay_from_gdf(
+                    rgb,
+                    gdf,
+                    transform,
+                    fill_color=np.array([255, 90, 70], dtype=np.float32),
+                    alpha=0.32,
+                    edge_color=np.array([220, 20, 20], dtype=np.float32),
+                )
+            elif name == "water":
+                self._apply_polygon_overlay_from_gdf(
+                    rgb,
+                    gdf,
+                    transform,
+                    fill_color=np.array([40, 130, 255], dtype=np.float32),
+                    alpha=0.38,
+                    edge_color=np.array([15, 85, 220], dtype=np.float32),
+                )
+            elif name == "big_streets":
+                self._apply_line_overlay_from_gdf(
+                    rgb,
+                    gdf,
+                    transform,
+                    line_color=np.array([245, 180, 45], dtype=np.float32),
+                    alpha=0.45,
+                )
+            elif name == "small_streets":
+                self._apply_line_overlay_from_gdf(
+                    rgb,
+                    gdf,
+                    transform,
+                    line_color=np.array([255, 220, 120], dtype=np.float32),
+                    alpha=0.45,
+                )
+
+        image = QImage(
+            rgb.data,
+            width,
+            height,
+            3 * width,
+            QImage.Format.Format_RGB888,
+        )
+        return QPixmap.fromImage(image.copy())
+
+    def _apply_polygon_overlay_from_gdf(
+        self,
+        rgb: np.ndarray,
+        gdf: gpd.GeoDataFrame,
+        raster_transform,
+        fill_color: np.ndarray,
+        alpha: float,
+        edge_color: np.ndarray | None = None,
+    ):
+        """Rasterize polygon geometries and blend them into the preview image."""
+        shapes = [(geom, 1) for geom in gdf.geometry if geom is not None and not geom.is_empty]
+        if not shapes:
+            return
+
+        mask = rasterize(
+            shapes,
+            out_shape=(rgb.shape[0], rgb.shape[1]),
+            transform=raster_transform,
+            fill=0,
+            all_touched=False,
+            dtype="uint8",
+        ).astype(bool)
+        if not mask.any():
+            return
+
+        rgb_f = rgb.astype(np.float32)
+        rgb_f[mask] = (1.0 - alpha) * rgb_f[mask] + alpha * fill_color
+
+        if edge_color is not None:
+            eroded = mask.copy()
+            eroded[1:, :] &= mask[:-1, :]
+            eroded[:-1, :] &= mask[1:, :]
+            eroded[:, 1:] &= mask[:, :-1]
+            eroded[:, :-1] &= mask[:, 1:]
+            edge = mask & (~eroded)
+            rgb_f[edge] = edge_color
+
+        rgb[:, :, :] = np.clip(rgb_f, 0, 255).astype(np.uint8)
+
+    def _apply_line_overlay_from_gdf(
+        self,
+        rgb: np.ndarray,
+        gdf: gpd.GeoDataFrame,
+        raster_transform,
+        line_color: np.ndarray,
+        alpha: float,
+    ):
+        """Rasterize line geometries and blend them into the preview image."""
+        shapes = [(geom, 1) for geom in gdf.geometry if geom is not None and not geom.is_empty]
+        if not shapes:
+            return
+
+        mask = rasterize(
+            shapes,
+            out_shape=(rgb.shape[0], rgb.shape[1]),
+            transform=raster_transform,
+            fill=0,
+            all_touched=True,
+            dtype="uint8",
+        ).astype(bool)
+        if not mask.any():
+            return
+
+        rgb_f = rgb.astype(np.float32)
+        rgb_f[mask] = (1.0 - alpha) * rgb_f[mask] + alpha * line_color
+        rgb[:, :, :] = np.clip(rgb_f, 0, 255).astype(np.uint8)
+
+    def _apply_landuse_overlay(self, rgb: np.ndarray, landuse_path: Path, raster_crs, raster_transform):
+        """Draw land use polygons as a green semi-transparent overlay in raster pixel space."""
+        try:
+            gdf = gpd.read_file(landuse_path)
+            if len(gdf) == 0 or "geometry" not in gdf.columns:
+                return
+
+            if raster_crs is not None and gdf.crs is not None and gdf.crs != raster_crs:
+                gdf = gdf.to_crs(raster_crs)
+
+            self._apply_polygon_overlay_from_gdf(
+                rgb,
+                gdf,
+                raster_transform,
+                fill_color=np.array([125, 180, 95], dtype=np.float32),
+                alpha=0.28,
+                edge_color=np.array([85, 140, 60], dtype=np.float32),
+            )
+        except Exception:
+            return
 
     def _apply_buildings_overlay(self, rgb: np.ndarray, buildings_path: Path, raster_crs, raster_transform):
         """Draw building polygons as a semi-transparent overlay in raster pixel space."""

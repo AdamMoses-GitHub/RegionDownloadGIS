@@ -14,6 +14,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import geopandas as gpd
 import numpy as np
 import rasterio
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from pyproj import Transformer
 from shapely.geometry import box
 
 from map_downloader.core.bbox import BoundingBox
@@ -55,7 +57,10 @@ class Exporter:
         reference_formats: Sequence[str],
         bbox_formats: Sequence[str],
         qgis_project_formats: Sequence[str],
+        readme_formats: Sequence[str] = (),
+        export_crs_mode: str = "source",
         bbox: Optional[BoundingBox] = None,
+        project=None,
     ) -> ExportResult:
         """Run export using current UI selections."""
         result = ExportResult(success=True)
@@ -69,39 +74,182 @@ class Exporter:
         reference_formats = self._normalize_formats(reference_formats)
         bbox_formats = self._normalize_formats(bbox_formats)
         qgis_project_formats = self._normalize_formats(qgis_project_formats)
+        readme_formats = self._normalize_formats(readme_formats)
+        target_crs, crs_messages = self._resolve_export_target_crs(export_crs_mode, bbox, project)
+        result.messages.extend(crs_messages)
 
         if terrain_formats:
-            self._export_terrain(result, terrain_formats)
+            self._export_terrain(result, terrain_formats, target_crs)
 
         if buildings_formats:
-            self._export_buildings(result, buildings_formats)
+            self._export_buildings(result, buildings_formats, target_crs)
 
         if landuse_formats:
-            self._export_landuse(result, landuse_formats)
+            self._export_landuse(result, landuse_formats, target_crs)
 
         if water_formats:
-            self._export_water(result, water_formats)
+            self._export_water(result, water_formats, target_crs)
 
         if big_streets_formats:
-            self._export_big_streets(result, big_streets_formats)
+            self._export_big_streets(result, big_streets_formats, target_crs)
 
         if small_streets_formats:
-            self._export_small_streets(result, small_streets_formats)
+            self._export_small_streets(result, small_streets_formats, target_crs)
 
         if reference_formats:
-            self._export_reference(result, reference_formats)
+            self._export_reference(result, reference_formats, target_crs)
 
         if bbox_formats:
-            self._export_bbox(result, bbox_formats, bbox)
+            self._export_bbox(result, bbox_formats, bbox, target_crs)
 
         if qgis_project_formats:
             self._export_qgis_project(result, qgis_project_formats, bbox)
+
+        if readme_formats:
+            self._export_readme(
+                result,
+                readme_formats,
+                bbox,
+                project,
+                export_crs_mode=export_crs_mode,
+                resolved_export_crs=target_crs,
+            )
 
         if not result.files:
             result.success = False
             result.messages.append("No matching source files were found to export.")
 
         return result
+
+    def _resolve_export_target_crs(
+        self,
+        export_crs_mode: str,
+        bbox: Optional[BoundingBox],
+        project,
+    ) -> tuple[Optional[str], List[str]]:
+        mode = (export_crs_mode or "source").strip().lower()
+        if mode in ("source", "keep", "keep_source"):
+            return None, []
+        if mode in ("epsg:4326", "4326", "wgs84"):
+            return "EPSG:4326", ["Export CRS mode: EPSG:4326"]
+        if mode in ("project_utm", "utm", "project utm"):
+            target = self._project_utm_authid(bbox, project)
+            if target:
+                return target, [f"Export CRS mode: {target}"]
+            return None, ["Export CRS mode requested Project UTM, but no bbox was available. Keeping source CRS."]
+        return None, [f"Unknown export CRS mode '{export_crs_mode}', keeping source CRS."]
+
+    def _project_utm_authid(self, bbox: Optional[BoundingBox], project) -> Optional[str]:
+        if bbox is None:
+            return None
+
+        override_zone = getattr(project, "utm_zone_override", None) if project is not None else None
+        if isinstance(override_zone, int) and 1 <= override_zone <= 60:
+            centroid_lat = (bbox.min_lat + bbox.max_lat) / 2
+            epsg_code = (32700 + override_zone) if centroid_lat < 0 else (32600 + override_zone)
+            return f"EPSG:{epsg_code}"
+
+        try:
+            return get_utm_epsg(bbox)
+        except Exception:
+            return None
+
+    def _export_readme(
+        self,
+        result: ExportResult,
+        formats: Sequence[str],
+        bbox: Optional[BoundingBox],
+        project,
+        export_crs_mode: str = "source",
+        resolved_export_crs: Optional[str] = None,
+    ) -> None:
+        if "README.md" not in formats:
+            result.messages.append("Skipped README: unsupported format selection.")
+            return
+
+        generated_files_before_readme = list(result.files)
+        project_name = getattr(project, "name", None) or self.output_root.name
+        resolution_m = getattr(project, "resolution_m", None)
+        output_folder = getattr(project, "output_folder", "") or str(self.output_root)
+        utm_override = getattr(project, "utm_zone_override", None)
+        timestamp_mode = getattr(project, "timestamp_mode", None)
+        layers = getattr(project, "layers", {}) if project is not None else {}
+
+        lines: List[str] = []
+        lines.append(f"# {project_name} - Export Summary")
+        lines.append("")
+        lines.append(f"- Generated: {datetime.now().isoformat(timespec='seconds')}")
+        lines.append(f"- Project output root: {self.output_root}")
+        lines.append(f"- Export directory: {self.export_dir}")
+        lines.append(f"- Configured output folder: {output_folder}")
+        if resolution_m is not None:
+            lines.append(f"- Target resolution (m): {resolution_m}")
+        if timestamp_mode:
+            lines.append(f"- Timestamp mode: {timestamp_mode}")
+        lines.append(f"- UTM zone override: {utm_override if utm_override is not None else 'auto'}")
+        lines.append(f"- Export CRS mode: {export_crs_mode}")
+        lines.append(f"- Resolved export CRS: {resolved_export_crs or 'source per layer'}")
+
+        lines.append("")
+        lines.append("## Bounding Box")
+        if bbox is None:
+            lines.append("- Unavailable")
+        else:
+            utm_epsg = bbox.get_utm_epsg()
+            min_e, min_n, max_e, max_n = bbox.get_utm_bounds()
+            sw_e, sw_n = min_e, min_n
+            se_e, se_n = max_e, min_n
+            ne_e, ne_n = max_e, max_n
+            nw_e, nw_n = min_e, max_n
+
+            lines.append("### WGS84 (lat/lon)")
+            lines.append(f"- Min lon/lat: {bbox.min_lon:.6f}, {bbox.min_lat:.6f}")
+            lines.append(f"- Max lon/lat: {bbox.max_lon:.6f}, {bbox.max_lat:.6f}")
+            lines.append(f"- SW corner (lon, lat): {bbox.min_lon:.6f}, {bbox.min_lat:.6f}")
+            lines.append(f"- SE corner (lon, lat): {bbox.max_lon:.6f}, {bbox.min_lat:.6f}")
+            lines.append(f"- NE corner (lon, lat): {bbox.max_lon:.6f}, {bbox.max_lat:.6f}")
+            lines.append(f"- NW corner (lon, lat): {bbox.min_lon:.6f}, {bbox.max_lat:.6f}")
+
+            lines.append("")
+            lines.append(f"### UTM (EPSG:{utm_epsg})")
+            lines.append(f"- UTM zone: {bbox.get_utm_zone()}")
+            lines.append(f"- UTM EPSG: {utm_epsg}")
+            lines.append(f"- SW corner (E, N): {sw_e:.3f}, {sw_n:.3f}")
+            lines.append(f"- SE corner (E, N): {se_e:.3f}, {se_n:.3f}")
+            lines.append(f"- NE corner (E, N): {ne_e:.3f}, {ne_n:.3f}")
+            lines.append(f"- NW corner (E, N): {nw_e:.3f}, {nw_n:.3f}")
+            lines.append(f"- Area (km^2): {bbox.area_km2():.3f}")
+            lines.append(f"- Width x Height (km): {bbox.width_km():.3f} x {bbox.height_km():.3f}")
+
+        lines.append("")
+        lines.append("## Layer Configuration")
+        if not layers:
+            lines.append("- Unavailable")
+        else:
+            for layer_name in sorted(layers.keys()):
+                cfg = layers[layer_name]
+                if callable(getattr(cfg, "as_dict", None)):
+                    cfg_data = cfg.as_dict()
+                elif isinstance(cfg, dict):
+                    cfg_data = cfg
+                else:
+                    cfg_data = {"value": str(cfg)}
+                lines.append(f"- {layer_name}:")
+                for key in sorted(cfg_data.keys()):
+                    lines.append(f"  - {key}: {cfg_data[key]}")
+
+        lines.append("")
+        lines.append("## Files Generated In This Export")
+        if generated_files_before_readme:
+            for path in generated_files_before_readme:
+                lines.append(f"- {path}")
+        else:
+            lines.append("- None")
+
+        dst = self._next_available_path("README", ".md")
+        dst.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result.files.append(str(dst))
+        result.messages.append(f"Exported project summary: {dst.name}")
 
     def _normalize_formats(self, formats: Sequence[str] | str | None) -> List[str]:
         if formats is None:
@@ -140,6 +288,66 @@ class Exporter:
     def _copy_raster(self, src: Path, stem: str, result: ExportResult) -> None:
         dst = self._next_available_path(stem, ".tif")
         copy2(src, dst)
+        result.files.append(str(dst))
+        result.messages.append(f"Exported raster: {dst.name}")
+
+    def _export_raster_geotiff(
+        self,
+        src: Path,
+        stem: str,
+        result: ExportResult,
+        target_crs: Optional[str],
+    ) -> None:
+        if not target_crs:
+            self._copy_raster(src, stem, result)
+            return
+
+        dst = self._next_available_path(stem, ".tif")
+        try:
+            with rasterio.open(src) as src_ds:
+                if src_ds.crs is None:
+                    result.messages.append(f"Skipped {stem}: source raster CRS is undefined.")
+                    return
+
+                if str(src_ds.crs) == target_crs:
+                    copy2(src, dst)
+                    result.files.append(str(dst))
+                    result.messages.append(f"Exported raster: {dst.name}")
+                    return
+
+                transform, width, height = calculate_default_transform(
+                    src_ds.crs,
+                    target_crs,
+                    src_ds.width,
+                    src_ds.height,
+                    *src_ds.bounds,
+                )
+                kwargs = src_ds.meta.copy()
+                kwargs.update(
+                    {
+                        "crs": target_crs,
+                        "transform": transform,
+                        "width": width,
+                        "height": height,
+                        "compress": "deflate",
+                    }
+                )
+
+                with rasterio.open(dst, "w", **kwargs) as dst_ds:
+                    for band_idx in range(1, src_ds.count + 1):
+                        reproject(
+                            source=rasterio.band(src_ds, band_idx),
+                            destination=rasterio.band(dst_ds, band_idx),
+                            src_transform=src_ds.transform,
+                            src_crs=src_ds.crs,
+                            dst_transform=transform,
+                            dst_crs=target_crs,
+                            resampling=Resampling.bilinear,
+                        )
+        except Exception as exc:
+            result.messages.append(f"Skipped {stem}: failed to reproject raster to {target_crs} ({exc}).")
+            return
+
         result.files.append(str(dst))
         result.messages.append(f"Exported raster: {dst.name}")
 
@@ -206,10 +414,13 @@ class Exporter:
         stem: str,
         target_format: str,
         result: ExportResult,
+        target_crs: Optional[str] = None,
     ) -> None:
         suffix, driver = DRIVER_MAP[target_format]
         dst = self._next_available_path(stem, suffix)
         gdf = gpd.read_file(src)
+        if target_crs and gdf.crs is not None and str(gdf.crs) != target_crs:
+            gdf = gdf.to_crs(target_crs)
         gdf.to_file(dst, driver=driver)
         result.files.append(str(dst))
         result.messages.append(f"Exported vector: {dst.name}")
@@ -329,7 +540,10 @@ class Exporter:
         stem: str,
         target_format: str,
         result: ExportResult,
+        target_crs: Optional[str] = None,
     ) -> None:
+        if target_crs and gdf.crs is not None and str(gdf.crs) != target_crs:
+            gdf = gdf.to_crs(target_crs)
         suffix, driver = DRIVER_MAP[target_format]
         dst = self._next_available_path(stem, suffix)
         gdf.to_file(dst, driver=driver)
@@ -354,7 +568,7 @@ class Exporter:
                 return candidate
             counter += 1
 
-    def _export_terrain(self, result: ExportResult, formats: Sequence[str]) -> None:
+    def _export_terrain(self, result: ExportResult, formats: Sequence[str], target_crs: Optional[str]) -> None:
         if "GeoTIFF" not in formats:
             result.messages.append("Skipped terrain: only GeoTIFF format is supported.")
             return
@@ -363,9 +577,14 @@ class Exporter:
         if src is None:
             result.messages.append("Skipped terrain: source file not found.")
             return
-        self._copy_raster(src, "terrain", result)
+        self._export_raster_geotiff(src, "terrain", result, target_crs)
 
-    def _export_buildings(self, result: ExportResult, target_formats: Sequence[str]) -> None:
+    def _export_buildings(
+        self,
+        result: ExportResult,
+        target_formats: Sequence[str],
+        target_crs: Optional[str],
+    ) -> None:
         src = self._find_first(["buildings*.geojson", "*buildings*.geojson", "buildings*.gpkg", "*.shp"])
         if src is None:
             result.messages.append("Skipped buildings: source file not found.")
@@ -381,30 +600,40 @@ class Exporter:
             if target_format not in DRIVER_MAP:
                 result.messages.append(f"Skipped buildings: unsupported format {target_format}.")
                 continue
-            self._convert_vector(src, "buildings", target_format, result)
+            self._convert_vector(src, "buildings", target_format, result, target_crs=target_crs)
 
-    def _export_landuse(self, result: ExportResult, target_formats: Sequence[str]) -> None:
+    def _export_landuse(
+        self,
+        result: ExportResult,
+        target_formats: Sequence[str],
+        target_crs: Optional[str],
+    ) -> None:
         raster_src = self._find_first(["nlcd*.tif", "landuse*.tif", "*landuse*raster*.tif"])
         vector_src = self._find_first(["landuse*.geojson", "*landuse*vector*.geojson", "*.gpkg", "*.shp"])
 
         for target_format in target_formats:
             if target_format == "GeoTIFF":
                 if raster_src is not None:
-                    self._copy_raster(raster_src, "landuse", result)
+                    self._export_raster_geotiff(raster_src, "landuse", result, target_crs)
                 else:
                     result.messages.append("Skipped land use raster: source file not found.")
                 continue
 
             if target_format in DRIVER_MAP:
                 if vector_src is not None:
-                    self._convert_vector(vector_src, "landuse", target_format, result)
+                    self._convert_vector(vector_src, "landuse", target_format, result, target_crs=target_crs)
                 else:
                     result.messages.append("Skipped land use vector: source file not found.")
                 continue
 
             result.messages.append(f"Skipped land use: unsupported format {target_format}.")
 
-    def _export_reference(self, result: ExportResult, formats: Sequence[str]) -> None:
+    def _export_reference(
+        self,
+        result: ExportResult,
+        formats: Sequence[str],
+        target_crs: Optional[str],
+    ) -> None:
         src_main = self._find_first(["reference.tif", "*reference.tif"])
         src_context = self._find_first(["reference_context.tif", "*reference_context.tif"])
 
@@ -415,9 +644,9 @@ class Exporter:
         for target_format in formats:
             if target_format == "GeoTIFF":
                 if src_main is not None:
-                    self._copy_raster(src_main, "reference", result)
+                    self._export_raster_geotiff(src_main, "reference", result, target_crs)
                 if src_context is not None:
-                    self._copy_raster(src_context, "reference_context", result)
+                    self._export_raster_geotiff(src_context, "reference_context", result, target_crs)
                 continue
 
             if target_format in ("PNG", "JPG"):
@@ -429,7 +658,12 @@ class Exporter:
 
             result.messages.append(f"Skipped reference: unsupported format {target_format}.")
 
-    def _export_water(self, result: ExportResult, target_formats: Sequence[str]) -> None:
+    def _export_water(
+        self,
+        result: ExportResult,
+        target_formats: Sequence[str],
+        target_crs: Optional[str],
+    ) -> None:
         src = self._find_first(["water*.geojson", "*water*.geojson", "water*.gpkg", "water*.shp"])
         if src is None:
             result.messages.append("Skipped water: source file not found.")
@@ -445,9 +679,14 @@ class Exporter:
             if target_format not in DRIVER_MAP:
                 result.messages.append(f"Skipped water: unsupported format {target_format}.")
                 continue
-            self._convert_vector(src, "water", target_format, result)
+            self._convert_vector(src, "water", target_format, result, target_crs=target_crs)
 
-    def _export_big_streets(self, result: ExportResult, target_formats: Sequence[str]) -> None:
+    def _export_big_streets(
+        self,
+        result: ExportResult,
+        target_formats: Sequence[str],
+        target_crs: Optional[str],
+    ) -> None:
         src = self._find_first(["big_streets*.geojson", "*big_streets*.geojson", "roads_major*.geojson", "*roads_major*.geojson"])
         if src is None:
             result.messages.append("Skipped big streets: source file not found.")
@@ -463,9 +702,14 @@ class Exporter:
             if target_format not in DRIVER_MAP:
                 result.messages.append(f"Skipped big streets: unsupported format {target_format}.")
                 continue
-            self._convert_vector(src, "big_streets", target_format, result)
+            self._convert_vector(src, "big_streets", target_format, result, target_crs=target_crs)
 
-    def _export_small_streets(self, result: ExportResult, target_formats: Sequence[str]) -> None:
+    def _export_small_streets(
+        self,
+        result: ExportResult,
+        target_formats: Sequence[str],
+        target_crs: Optional[str],
+    ) -> None:
         src = self._find_first(["small_streets*.geojson", "*small_streets*.geojson", "roads_minor*.geojson", "*roads_minor*.geojson"])
         if src is None:
             result.messages.append("Skipped small streets: source file not found.")
@@ -481,36 +725,54 @@ class Exporter:
             if target_format not in DRIVER_MAP:
                 result.messages.append(f"Skipped small streets: unsupported format {target_format}.")
                 continue
-            self._convert_vector(src, "small_streets", target_format, result)
+            self._convert_vector(src, "small_streets", target_format, result, target_crs=target_crs)
 
     def _export_bbox(
         self,
         result: ExportResult,
         target_formats: Sequence[str],
         bbox: Optional[BoundingBox],
+        target_crs: Optional[str],
     ) -> None:
         if bbox is None:
             result.messages.append("Skipped bounding box: project bbox is unavailable.")
             return
 
-        geom = box(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        gdf = gpd.GeoDataFrame(
-            [{"name": "bounding_box"}],
-            geometry=[geom],
-            crs="EPSG:4326",
+        geom_wgs = box(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        strict_utm_authid = f"EPSG:{bbox.get_utm_epsg()}"
+        use_strict_utm_geom = (
+            target_crs is not None
+            and bbox.has_strict_utm_bounds()
+            and target_crs.upper() == strict_utm_authid
         )
+
+        if use_strict_utm_geom:
+            min_e, min_n, max_e, max_n = bbox.get_utm_bounds()
+            geom_vector = box(min_e, min_n, max_e, max_n)
+            gdf = gpd.GeoDataFrame(
+                [{"name": "bounding_box"}],
+                geometry=[geom_vector],
+                crs=strict_utm_authid,
+            )
+        else:
+            geom_vector = geom_wgs
+            gdf = gpd.GeoDataFrame(
+                [{"name": "bounding_box"}],
+                geometry=[geom_vector],
+                crs="EPSG:4326",
+            )
 
         for target_format in target_formats:
             if target_format == "KML":
-                self._write_bbox_kml(result, geom, as_kmz=False)
+                self._write_bbox_kml(result, geom_wgs, as_kmz=False)
                 continue
             if target_format == "KMZ":
-                self._write_bbox_kml(result, geom, as_kmz=True)
+                self._write_bbox_kml(result, geom_wgs, as_kmz=True)
                 continue
             if target_format not in DRIVER_MAP:
                 result.messages.append(f"Skipped bounding box: unsupported format {target_format}.")
                 continue
-            self._write_vector_gdf(gdf, "bounding_box", target_format, result)
+            self._write_vector_gdf(gdf, "bounding_box", target_format, result, target_crs=target_crs)
 
     def _write_bbox_kml(self, result: ExportResult, geom, as_kmz: bool) -> None:
         coords = list(geom.exterior.coords)
@@ -598,28 +860,9 @@ class Exporter:
 
     def _infer_project_authid(self, files: Sequence[Path], bbox: Optional[BoundingBox]) -> str:
         for path in files:
-            suffix = path.suffix.lower()
-            try:
-                if suffix in (".tif", ".tiff"):
-                    with rasterio.open(path) as ds:
-                        if ds.crs is not None:
-                            epsg = ds.crs.to_epsg()
-                            if epsg:
-                                return f"EPSG:{epsg}"
-                            crs_text = str(ds.crs)
-                            if crs_text.startswith("EPSG:"):
-                                return crs_text
-                elif suffix in (".geojson", ".gpkg", ".shp", ".kml", ".kmz"):
-                    gdf = gpd.read_file(path)
-                    if gdf.crs is not None:
-                        epsg = gdf.crs.to_epsg()
-                        if epsg:
-                            return f"EPSG:{epsg}"
-                        crs_text = str(gdf.crs)
-                        if crs_text.startswith("EPSG:"):
-                            return crs_text
-            except Exception:
-                continue
+            detected = self._infer_path_authid(path)
+            if detected:
+                return detected
 
         if bbox is not None:
             try:
@@ -627,6 +870,32 @@ class Exporter:
             except Exception:
                 pass
         return "EPSG:4326"
+
+    def _infer_path_authid(self, path: Path) -> Optional[str]:
+        """Infer an EPSG authid for one dataset path when available."""
+        suffix = path.suffix.lower()
+        try:
+            if suffix in (".tif", ".tiff"):
+                with rasterio.open(path) as ds:
+                    if ds.crs is not None:
+                        epsg = ds.crs.to_epsg()
+                        if epsg:
+                            return f"EPSG:{epsg}"
+                        crs_text = str(ds.crs)
+                        if crs_text.startswith("EPSG:"):
+                            return crs_text
+            elif suffix in (".geojson", ".gpkg", ".shp", ".kml", ".kmz"):
+                gdf = gpd.read_file(path)
+                if gdf.crs is not None:
+                    epsg = gdf.crs.to_epsg()
+                    if epsg:
+                        return f"EPSG:{epsg}"
+                    crs_text = str(gdf.crs)
+                    if crs_text.startswith("EPSG:"):
+                        return crs_text
+        except Exception:
+            return None
+        return None
 
     def _build_qgs_text(self, files: Sequence[Path], authid: str) -> str:
         selected = self._select_qgis_layers(files)
@@ -646,6 +915,8 @@ class Exporter:
             name_xml = escape(layer_name)
             id_xml = escape(layer_id)
             group_name = escape(layer["group"])
+            layer_authid = self._infer_path_authid(path) or authid
+            layer_authid_xml = escape(layer_authid)
 
             group_entries.append(
                 "    <layer-tree-group checked=\"Qt::Checked\" expanded=\"1\" "
@@ -663,7 +934,7 @@ class Exporter:
                 f"    <provider encoding=\"UTF-8\">{layer['provider']}</provider>\n"
                 "    <srs>\n"
                 "      <spatialrefsys>\n"
-                f"        <authid>{authid_xml}</authid>\n"
+                f"        <authid>{layer_authid_xml}</authid>\n"
                 "      </spatialrefsys>\n"
                 "    </srs>\n"
                 "  </maplayer>"

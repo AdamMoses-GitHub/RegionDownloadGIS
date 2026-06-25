@@ -31,7 +31,7 @@ from map_downloader.gui.pages.p3_output import OutputPage
 from map_downloader.export import Exporter
 from map_downloader.processing.merge import augment_with_height
 from map_downloader.processing.reproject import reproject_raster, reproject_vector, get_utm_epsg
-from map_downloader.processing.resample import resample_raster, crop_and_resample_raster
+from map_downloader.processing.resample import resample_raster, crop_raster, crop_and_resample_raster
 
 
 class _DummyDownloader(DownloaderBase):
@@ -98,6 +98,23 @@ class HardeningTests(unittest.TestCase):
         self.assertGreater(bbox.area_km2(), 0)
         self.assertIsInstance(bbox.hash(), str)
 
+    def test_bbox_from_utm_preserves_strict_bounds(self):
+        bbox = BoundingBox.from_corners(
+            4636800.0,
+            422900.0,
+            4641300.0,
+            427800.0,
+            crs="utm",
+            utm_zone=16,
+        )
+
+        self.assertTrue(bbox.has_strict_utm_bounds())
+        min_e, min_n, max_e, max_n = bbox.get_utm_bounds()
+        self.assertEqual(min_e, 422900.0)
+        self.assertEqual(min_n, 4636800.0)
+        self.assertEqual(max_e, 427800.0)
+        self.assertEqual(max_n, 4641300.0)
+
     def test_reproject_and_resample_raster_smoke(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -149,6 +166,44 @@ class HardeningTests(unittest.TestCase):
             out_gdf = gpd.read_file(out_path)
             self.assertEqual(len(out_gdf), 1)
             self.assertEqual(out_gdf.iloc[0]["name"], "inside")
+
+    def test_reproject_vector_uses_strict_utm_clip_rectangle(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src_path = root / "src_utm.geojson"
+            out_path = root / "clipped_utm.geojson"
+            bbox = BoundingBox.from_corners(
+                4500000.0,
+                500000.0,
+                4501000.0,
+                501000.0,
+                crs="utm",
+                utm_zone=18,
+            )
+
+            gdf = gpd.GeoDataFrame(
+                {"name": ["inside", "outside"]},
+                geometry=gpd.GeoSeries.from_wkt(
+                    [
+                        "POLYGON ((500100 4500100, 500900 4500100, 500900 4500900, 500100 4500900, 500100 4500100))",
+                        "POLYGON ((501100 4500100, 501900 4500100, 501900 4500900, 501100 4500900, 501100 4500100))",
+                    ]
+                ),
+                crs="EPSG:32618",
+            )
+            gdf.to_file(src_path, driver="GeoJSON")
+
+            self.assertTrue(reproject_vector(src_path, out_path, "EPSG:32618", "GeoJSON", clip_bbox=bbox))
+
+            out_gdf = gpd.read_file(out_path)
+            self.assertEqual(len(out_gdf), 1)
+            self.assertEqual(out_gdf.iloc[0]["name"], "inside")
+
+            minx, miny, maxx, maxy = out_gdf.total_bounds
+            self.assertGreaterEqual(minx, 500000.0)
+            self.assertLessEqual(maxx, 501000.0)
+            self.assertGreaterEqual(miny, 4500000.0)
+            self.assertLessEqual(maxy, 4501000.0)
 
     def test_downloader_cache_key_changes_with_options(self):
         with tempfile.TemporaryDirectory() as td:
@@ -213,6 +268,31 @@ class HardeningTests(unittest.TestCase):
             self.assertFalse(crop_and_resample_raster(src_path, out_path, bbox, 0))
             self.assertFalse(temp_crop.exists())
 
+    def test_crop_raster_returns_false_when_bbox_outside_raster(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src_path = root / "src.tif"
+            out_path = root / "cropped.tif"
+
+            arr = np.arange(100, dtype="float32").reshape(10, 10)
+            with rasterio.open(
+                src_path,
+                "w",
+                driver="GTiff",
+                height=10,
+                width=10,
+                count=1,
+                dtype="float32",
+                crs="EPSG:4326",
+                transform=from_origin(-74.01, 40.71, 0.001, 0.001),
+            ) as dst:
+                dst.write(arr, 1)
+
+            # Deliberately outside source raster extent.
+            far_bbox = BoundingBox(-120.01, 35.70, -120.00, 35.71)
+            self.assertFalse(crop_raster(src_path, out_path, far_bbox))
+            self.assertFalse(out_path.exists())
+
     def test_reference_fetch_tile_counts_retry_failures(self):
         downloader = ReferenceDownloader()
         tile = mercantile.Tile(x=0, y=0, z=1)
@@ -274,12 +354,14 @@ class HardeningTests(unittest.TestCase):
         self.assertEqual(elems[0].get("id"), 123)
 
     def test_conus_city_presets_include_5x5_variants(self):
-        self.assertEqual(len(BASE_CITY_PRESETS), 20)
-        self.assertEqual(len(CITY_PRESETS), 40)
+        self.assertEqual(len(BASE_CITY_PRESETS), 10)
+        self.assertEqual(len(CITY_PRESETS), 20)
         self.assertIn("New York City (Full)", CITY_PRESETS)
         self.assertIn("Los Angeles (Full)", CITY_PRESETS)
+        self.assertIn("Washington, DC (Full)", CITY_PRESETS)
         self.assertIn("New York City (5x5km)", CITY_PRESETS)
         self.assertIn("Los Angeles (5x5km)", CITY_PRESETS)
+        self.assertIn("Washington, DC (5x5km)", CITY_PRESETS)
 
         for bounds in CITY_PRESETS.values():
             self.assertEqual(len(bounds), 4)
@@ -327,6 +409,37 @@ class HardeningTests(unittest.TestCase):
         self.assertAlmostEqual(roundtrip_bbox.min_lon, original_bbox.min_lon, places=4)
         self.assertAlmostEqual(roundtrip_bbox.max_lat, original_bbox.max_lat, places=4)
         self.assertAlmostEqual(roundtrip_bbox.max_lon, original_bbox.max_lon, places=4)
+
+    def test_bbox_widget_utm_auto_zone_is_allowed(self):
+        self._ensure_qapp()
+        widget = BboxInputWidget()
+        self.assertEqual(widget.utm_zone_input.minimum(), 0)
+        self.assertEqual(widget.utm_zone_input.value(), 0)
+
+    def test_bbox_widget_utm_zone_change_preserves_bbox(self):
+        self._ensure_qapp()
+        widget = BboxInputWidget()
+
+        widget.mode_corners.setChecked(True)
+        widget.crs_latlong.setChecked(True)
+        widget.lat1_input.setValue(47.700000)
+        widget.lon1_input.setValue(-122.500000)
+        widget.lat2_input.setValue(47.600000)
+        widget.lon2_input.setValue(-122.300000)
+
+        widget.crs_utm.setChecked(True)
+        bbox_before = widget.get_bbox()
+        zone_before = widget.utm_zone_input.value()
+        self.assertGreater(zone_before, 0)
+
+        zone_after = zone_before + 1 if zone_before < 60 else zone_before - 1
+        widget.utm_zone_input.setValue(zone_after)
+        bbox_after = widget.get_bbox()
+
+        self.assertAlmostEqual(bbox_after.min_lat, bbox_before.min_lat, places=4)
+        self.assertAlmostEqual(bbox_after.min_lon, bbox_before.min_lon, places=4)
+        self.assertAlmostEqual(bbox_after.max_lat, bbox_before.max_lat, places=4)
+        self.assertAlmostEqual(bbox_after.max_lon, bbox_before.max_lon, places=4)
 
     def test_bbox_widget_utm_rounding_to_nearest_100m(self):
         self._ensure_qapp()
@@ -795,6 +908,68 @@ class HardeningTests(unittest.TestCase):
             with zipfile.ZipFile(kmz_paths[0], "r") as zf:
                 self.assertIn("doc.kml", zf.namelist())
 
+    def test_exporter_reprojects_vectors_to_epsg4326_when_requested(self):
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+
+        with tempfile.TemporaryDirectory() as td:
+            output_root = Path(td)
+            processed = output_root / "processed"
+            processed.mkdir(parents=True, exist_ok=True)
+
+            gdf = gpd.GeoDataFrame(
+                [{"id": 1, "geometry": Polygon([(500000, 4500000), (500100, 4500000), (500100, 4500100), (500000, 4500100)])}],
+                crs="EPSG:32618",
+            )
+            gdf.to_file(processed / "buildings.geojson", driver="GeoJSON")
+
+            exporter = Exporter(output_root)
+            result = exporter.export(
+                terrain_formats=[],
+                buildings_formats=["GeoJSON"],
+                landuse_formats=[],
+                water_formats=[],
+                big_streets_formats=[],
+                small_streets_formats=[],
+                reference_formats=[],
+                bbox_formats=[],
+                qgis_project_formats=[],
+                export_crs_mode="epsg:4326",
+                bbox=None,
+            )
+
+            self.assertTrue(result.success)
+            out_path = next(Path(path) for path in result.files if path.endswith("buildings.geojson"))
+            out_gdf = gpd.read_file(out_path)
+            self.assertEqual(out_gdf.crs.to_epsg(), 4326)
+
+    def test_exporter_reprojects_bbox_to_project_utm_when_requested(self):
+        import geopandas as gpd
+
+        with tempfile.TemporaryDirectory() as td:
+            output_root = Path(td)
+            exporter = Exporter(output_root)
+            bbox = BoundingBox(-74.01, 40.70, -74.00, 40.71)
+
+            result = exporter.export(
+                terrain_formats=[],
+                buildings_formats=[],
+                landuse_formats=[],
+                water_formats=[],
+                big_streets_formats=[],
+                small_streets_formats=[],
+                reference_formats=[],
+                bbox_formats=["GeoJSON"],
+                qgis_project_formats=[],
+                export_crs_mode="project_utm",
+                bbox=bbox,
+            )
+
+            self.assertTrue(result.success)
+            out_path = next(Path(path) for path in result.files if path.endswith("bounding_box.geojson"))
+            out_gdf = gpd.read_file(out_path)
+            self.assertEqual(out_gdf.crs.to_epsg(), 32618)
+
     def test_exporter_can_export_reference_png_and_jpg(self):
         try:
             from PIL import Image  # noqa: F401
@@ -1083,6 +1258,117 @@ class HardeningTests(unittest.TestCase):
                 self.assertIn("project.qgs", zf.namelist())
                 qgs_text = zf.read("project.qgs").decode("utf-8")
                 self.assertIn("<authid>EPSG:32618</authid>", qgs_text)
+
+    def test_exporter_can_export_project_readme(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_root = Path(td)
+            processed = output_root / "processed"
+            processed.mkdir(parents=True, exist_ok=True)
+
+            src = processed / "terrain.tif"
+            arr = np.arange(100, dtype="float32").reshape(10, 10)
+            with rasterio.open(
+                src,
+                "w",
+                driver="GTiff",
+                height=10,
+                width=10,
+                count=1,
+                dtype="float32",
+                crs="EPSG:32618",
+                transform=from_origin(500000, 4500000, 1, 1),
+            ) as dst:
+                dst.write(arr, 1)
+
+            bbox = BoundingBox(-74.01, 40.70, -74.00, 40.71)
+            project = Project(name="README Test Project")
+            project.set_bbox(bbox)
+            project.output_folder = str(output_root)
+            project.resolution_m = 5.0
+
+            exporter = Exporter(output_root)
+            result = exporter.export(
+                terrain_formats=["GeoTIFF"],
+                buildings_formats=[],
+                landuse_formats=[],
+                water_formats=[],
+                big_streets_formats=[],
+                small_streets_formats=[],
+                reference_formats=[],
+                bbox_formats=[],
+                qgis_project_formats=[],
+                readme_formats=["README.md"],
+                bbox=bbox,
+                project=project,
+            )
+
+            self.assertTrue(result.success)
+            readme_paths = [Path(path) for path in result.files if Path(path).name.lower().startswith("readme")]
+            self.assertTrue(readme_paths)
+            readme_text = readme_paths[0].read_text(encoding="utf-8")
+            self.assertIn("README Test Project", readme_text)
+            self.assertIn("## Bounding Box", readme_text)
+            self.assertIn("## Layer Configuration", readme_text)
+            self.assertIn("## Files Generated In This Export", readme_text)
+
+    def test_exporter_readme_uses_strict_utm_corners_when_available(self):
+        with tempfile.TemporaryDirectory() as td:
+            output_root = Path(td)
+            processed = output_root / "processed"
+            processed.mkdir(parents=True, exist_ok=True)
+
+            src = processed / "terrain.tif"
+            arr = np.arange(100, dtype="float32").reshape(10, 10)
+            with rasterio.open(
+                src,
+                "w",
+                driver="GTiff",
+                height=10,
+                width=10,
+                count=1,
+                dtype="float32",
+                crs="EPSG:32616",
+                transform=from_origin(422900, 4641300, 30, 30),
+            ) as dst:
+                dst.write(arr, 1)
+
+            bbox = BoundingBox.from_corners(
+                4636800.0,
+                422900.0,
+                4641300.0,
+                427800.0,
+                crs="utm",
+                utm_zone=16,
+            )
+            project = Project(name="README UTM Corners")
+            project.set_bbox(bbox)
+            project.output_folder = str(output_root)
+
+            exporter = Exporter(output_root)
+            result = exporter.export(
+                terrain_formats=["GeoTIFF"],
+                buildings_formats=[],
+                landuse_formats=[],
+                water_formats=[],
+                big_streets_formats=[],
+                small_streets_formats=[],
+                reference_formats=[],
+                bbox_formats=[],
+                qgis_project_formats=[],
+                readme_formats=["README.md"],
+                bbox=bbox,
+                project=project,
+                export_crs_mode="project_utm",
+            )
+
+            self.assertTrue(result.success)
+            readme_paths = [Path(path) for path in result.files if Path(path).name.lower().startswith("readme")]
+            self.assertTrue(readme_paths)
+            readme_text = readme_paths[0].read_text(encoding="utf-8")
+            self.assertIn("SW corner (E, N): 422900.000, 4636800.000", readme_text)
+            self.assertIn("SE corner (E, N): 427800.000, 4636800.000", readme_text)
+            self.assertIn("NE corner (E, N): 427800.000, 4641300.000", readme_text)
+            self.assertIn("NW corner (E, N): 422900.000, 4641300.000", readme_text)
 
     def test_qgs_uses_one_format_per_datatype_and_reference_off(self):
         import geopandas as gpd

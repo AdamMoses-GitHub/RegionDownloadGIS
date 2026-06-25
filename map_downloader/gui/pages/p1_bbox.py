@@ -20,7 +20,9 @@ class BboxPage(QWizardPage):
             "• Four corners (NW and SE)\n"
             "• Centroid point + width and height\n"
             "\n"
-            "Coordinates can be in Lat/Long (WGS84) or UTM."
+            "Coordinates can be in Lat/Long (WGS84) or UTM.\n"
+            "\n"
+            "UTM mode preserves exact UTM min/max rectangle edges through processing and export."
         )
         layout.addWidget(instructions)
         

@@ -98,7 +98,7 @@ def reproject_vector(
         gdf_reprojected = gdf.to_crs(target_crs)
 
         if clip_bbox is not None:
-            clip_geom = gpd.GeoSeries([clip_bbox.to_polygon_wgs84()], crs="EPSG:4326").to_crs(target_crs).iloc[0]
+            clip_geom = clip_bbox.to_polygon_in_crs(target_crs)
             gdf_reprojected = gdf_reprojected[gdf_reprojected.geometry.intersects(clip_geom)].copy()
             gdf_reprojected.geometry = gdf_reprojected.geometry.intersection(clip_geom)
             gdf_reprojected = gdf_reprojected[

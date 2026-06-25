@@ -24,6 +24,11 @@ class BoundingBox:
     
     # Optional user-specified UTM zone override (e.g., 18)
     utm_zone_override: Optional[int] = None
+    # Optional strict UTM rectangle bounds in meters (preserved for UTM input mode)
+    utm_min_e: Optional[float] = None
+    utm_min_n: Optional[float] = None
+    utm_max_e: Optional[float] = None
+    utm_max_n: Optional[float] = None
     
     @classmethod
     def from_corners(cls, lat1: float, lon1: float, lat2: float, lon2: float, 
@@ -45,17 +50,29 @@ class BoundingBox:
         elif crs == "utm":
             if utm_zone is None:
                 raise ValueError("utm_zone required when crs='utm'")
-            # Convert from UTM to WGS84
+            min_n, max_n = min(lat1, lat2), max(lat1, lat2)
+            min_e, max_e = min(lon1, lon2), max(lon1, lon2)
+
+            # Convert UTM rectangle corners to WGS84 envelope for API-friendly storage
+            centroid_n = (min_n + max_n) / 2
             transformer = Transformer.from_crs(
-                CRS.from_epsg(_utm_zone_to_epsg(utm_zone, lat1)),
+                CRS.from_epsg(_utm_zone_to_epsg(utm_zone, centroid_n)),
                 "EPSG:4326", always_xy=True
             )
-            lon1_wgs, lat1_wgs = transformer.transform(lon1, lat1)
-            lon2_wgs, lat2_wgs = transformer.transform(lon2, lat2)
-            min_lat, max_lat = min(lat1_wgs, lat2_wgs), max(lat1_wgs, lat2_wgs)
-            min_lon, max_lon = min(lon1_wgs, lon2_wgs), max(lon1_wgs, lon2_wgs)
+
+            wgs_points = [
+                transformer.transform(min_e, min_n),
+                transformer.transform(max_e, min_n),
+                transformer.transform(max_e, max_n),
+                transformer.transform(min_e, max_n),
+            ]
+            lons = [p[0] for p in wgs_points]
+            lats = [p[1] for p in wgs_points]
+            min_lat, max_lat = min(lats), max(lats)
+            min_lon, max_lon = min(lons), max(lons)
             return cls(min_lon=min_lon, min_lat=min_lat,
-                      max_lon=max_lon, max_lat=max_lat, utm_zone_override=utm_zone)
+                      max_lon=max_lon, max_lat=max_lat, utm_zone_override=utm_zone,
+                      utm_min_e=min_e, utm_min_n=min_n, utm_max_e=max_e, utm_max_n=max_n)
         else:
             raise ValueError(f"Unknown crs: {crs}")
     
@@ -89,24 +106,61 @@ class BoundingBox:
         elif crs == "utm":
             if utm_zone is None:
                 raise ValueError("utm_zone required when crs='utm'")
-            half_width = width_m / 2
-            half_height = height_m / 2
-            # Create UTM corners, convert to WGS84
+
+            # Inputs in UTM mode are northing/easting meters.
+            center_n = centroid_lat
+            center_e = centroid_lon
+            half_width = width_m / 2.0
+            half_height = height_m / 2.0
+            min_e, max_e = center_e - half_width, center_e + half_width
+            min_n, max_n = center_n - half_height, center_n + half_height
+
+            # Create UTM rectangle corners, convert to WGS84 envelope.
             transformer = Transformer.from_crs(
-                CRS.from_epsg(_utm_zone_to_epsg(utm_zone, centroid_lat)),
+                CRS.from_epsg(_utm_zone_to_epsg(utm_zone, center_n)),
                 "EPSG:4326", always_xy=True
             )
-            lon_nw, lat_nw = transformer.transform(centroid_lon - half_width, centroid_lat + half_height)
-            lon_se, lat_se = transformer.transform(centroid_lon + half_width, centroid_lat - half_height)
+
+            wgs_points = [
+                transformer.transform(min_e, min_n),
+                transformer.transform(max_e, min_n),
+                transformer.transform(max_e, max_n),
+                transformer.transform(min_e, max_n),
+            ]
+            lons = [p[0] for p in wgs_points]
+            lats = [p[1] for p in wgs_points]
+
             return cls(
-                min_lon=min(lon_nw, lon_se),
-                max_lon=max(lon_nw, lon_se),
-                min_lat=min(lat_nw, lat_se),
-                max_lat=max(lat_nw, lat_se),
-                utm_zone_override=utm_zone
+                min_lon=min(lons),
+                max_lon=max(lons),
+                min_lat=min(lats),
+                max_lat=max(lats),
+                utm_zone_override=utm_zone,
+                utm_min_e=min_e,
+                utm_min_n=min_n,
+                utm_max_e=max_e,
+                utm_max_n=max_n,
             )
         else:
             raise ValueError(f"Unknown crs: {crs}")
+
+    def has_strict_utm_bounds(self) -> bool:
+        """True when this bbox includes preserved axis-aligned UTM min/max bounds."""
+        return all(v is not None for v in [self.utm_min_e, self.utm_min_n, self.utm_max_e, self.utm_max_n])
+
+    def get_utm_bounds(self) -> tuple[float, float, float, float]:
+        """Get UTM bounds as (min_e, min_n, max_e, max_n)."""
+        if self.has_strict_utm_bounds():
+            return (
+                float(self.utm_min_e),
+                float(self.utm_min_n),
+                float(self.utm_max_e),
+                float(self.utm_max_n),
+            )
+
+        utm_poly = self.get_utm_polygon()
+        min_e, min_n, max_e, max_n = utm_poly.bounds
+        return (float(min_e), float(min_n), float(max_e), float(max_n))
     
     def get_utm_zone(self) -> int:
         """Get UTM zone, using override if set, otherwise auto-detect from centroid."""
@@ -131,12 +185,38 @@ class BoundingBox:
     
     def get_utm_polygon(self) -> Polygon:
         """Return bbox as UTM Polygon."""
+        if self.has_strict_utm_bounds():
+            min_e, min_n, max_e, max_n = self.get_utm_bounds()
+            return box(min_e, min_n, max_e, max_n)
+
         transformer = Transformer.from_crs("EPSG:4326", 
                                           CRS.from_epsg(self.get_utm_epsg()),
                                           always_xy=True)
         wgs_poly = self.get_wgs84_polygon()
         utm_poly = Polygon([transformer.transform(lon, lat) for lon, lat in wgs_poly.exterior.coords])
         return utm_poly
+
+    def to_polygon_in_crs(self, target_crs) -> Polygon:
+        """Return bbox polygon in target CRS, preferring strict UTM rectangle when available."""
+        target = CRS.from_user_input(target_crs)
+
+        if self.has_strict_utm_bounds():
+            source = CRS.from_epsg(self.get_utm_epsg())
+            min_e, min_n, max_e, max_n = self.get_utm_bounds()
+            strict_poly = box(min_e, min_n, max_e, max_n)
+            if source == target:
+                return strict_poly
+
+            transformer = Transformer.from_crs(source, target, always_xy=True)
+            return Polygon([transformer.transform(x, y) for x, y in strict_poly.exterior.coords])
+
+        source = CRS.from_epsg(4326)
+        if source == target:
+            return self.get_wgs84_polygon()
+
+        transformer = Transformer.from_crs(source, target, always_xy=True)
+        wgs_poly = self.get_wgs84_polygon()
+        return Polygon([transformer.transform(lon, lat) for lon, lat in wgs_poly.exterior.coords])
 
     def to_polygon_utm(self) -> Polygon:
         """Compatibility alias used by downloader/processing modules."""
@@ -207,6 +287,10 @@ class BoundingBox:
             "max_lon": self.max_lon,
             "max_lat": self.max_lat,
             "utm_zone_override": self.utm_zone_override,
+            "utm_min_e": self.utm_min_e,
+            "utm_min_n": self.utm_min_n,
+            "utm_max_e": self.utm_max_e,
+            "utm_max_n": self.utm_max_n,
         }
     
     @classmethod
@@ -218,6 +302,10 @@ class BoundingBox:
             max_lon=data["max_lon"],
             max_lat=data["max_lat"],
             utm_zone_override=data.get("utm_zone_override"),
+            utm_min_e=data.get("utm_min_e"),
+            utm_min_n=data.get("utm_min_n"),
+            utm_max_e=data.get("utm_max_e"),
+            utm_max_n=data.get("utm_max_n"),
         )
 
 

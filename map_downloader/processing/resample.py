@@ -8,8 +8,7 @@ from rasterio.mask import mask
 from rasterio.warp import reproject, Resampling
 from rasterio.transform import from_bounds
 import numpy as np
-from shapely.ops import transform as shapely_transform
-from pyproj import Transformer
+from shapely.geometry import box
 
 from map_downloader.core.bbox import BoundingBox
 
@@ -34,13 +33,17 @@ def crop_raster(
     """
     try:
         with rasterio.open(input_path) as src:
-            # Reproject WGS84 bbox polygon to source raster CRS for masking
-            bbox_poly_wgs84 = bbox.to_polygon_wgs84()
-            if src.crs is not None and str(src.crs) != "EPSG:4326":
-                transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-                bbox_poly = shapely_transform(transformer.transform, bbox_poly_wgs84)
+            # Prefer strict UTM rectangle when available, otherwise use WGS84 bbox.
+            if src.crs is not None:
+                bbox_poly = bbox.to_polygon_in_crs(src.crs)
             else:
-                bbox_poly = bbox_poly_wgs84
+                bbox_poly = bbox.to_polygon_wgs84()
+
+            # Fast pre-check: avoid invoking rasterio.mask when there is no overlap.
+            raster_bounds_poly = box(src.bounds.left, src.bounds.bottom, src.bounds.right, src.bounds.top)
+            if not bbox_poly.intersects(raster_bounds_poly):
+                print("Error cropping raster: requested bbox does not overlap raster bounds")
+                return False
             
             # Crop raster
             out_image, out_transform = mask(src, [bbox_poly], crop=True)

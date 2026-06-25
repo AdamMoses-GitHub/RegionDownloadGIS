@@ -17,23 +17,13 @@ BASE_CITY_PRESETS = {
     "New York City": (40.30, -74.50, 41.10, -73.50),
     "Los Angeles": (33.60, -118.95, 34.45, -117.65),
     "Chicago": (41.30, -88.60, 42.50, -87.20),
-    "Dallas": (32.35, -97.70, 33.25, -96.35),
     "Houston": (29.25, -95.95, 30.25, -94.85),
-    "Washington, DC": (38.55, -77.65, 39.25, -76.70),
-    "Miami": (25.30, -80.90, 26.30, -80.00),
-    "Philadelphia": (39.55, -75.85, 40.40, -74.75),
-    "Atlanta": (33.20, -84.90, 34.40, -83.80),
     "Phoenix": (33.00, -112.60, 34.10, -111.30),
-    "Boston": (41.95, -71.80, 42.95, -70.60),
-    "Riverside": (33.45, -117.80, 34.35, -116.20),
-    "San Francisco": (37.10, -123.10, 38.55, -121.45),
-    "Detroit": (42.00, -83.75, 42.95, -82.50),
-    "Seattle": (47.00, -122.75, 47.90, -121.40),
-    "Minneapolis": (44.55, -93.85, 45.45, -92.75),
+    "Philadelphia": (39.55, -75.85, 40.40, -74.75),
+    "San Antonio": (29.15, -98.95, 29.80, -98.10),
     "San Diego": (32.50, -117.60, 33.50, -116.50),
-    "Tampa": (27.55, -82.95, 28.45, -82.10),
-    "Denver": (39.35, -105.40, 40.20, -104.20),
-    "Baltimore": (39.00, -77.15, 39.75, -76.20),
+    "Dallas": (32.35, -97.70, 33.25, -96.35),
+    "Washington, DC": (38.55, -77.65, 39.25, -76.70),
 }
 
 
@@ -219,6 +209,7 @@ class BboxInputWidget(QWidget):
         self.bbox = None
         self._updating_ui = False
         self._last_crs = "latlong"
+        self._active_utm_zone: int | None = None
         self._init_ui()
     
     def _init_ui(self):
@@ -343,7 +334,7 @@ class BboxInputWidget(QWidget):
         utm_layout = QHBoxLayout()
         utm_layout.addWidget(QLabel("UTM Zone Override:"))
         self.utm_zone_input = QSpinBox()
-        self.utm_zone_input.setRange(1, 60)
+        self.utm_zone_input.setRange(0, 60)
         self.utm_zone_input.setValue(0)
         self.utm_zone_input.setPrefix("Auto (0) or ")
         utm_layout.addWidget(self.utm_zone_input)
@@ -473,7 +464,44 @@ class BboxInputWidget(QWidget):
         """When zone changes in UTM mode, keep same bbox by re-projecting displayed values."""
         if self._updating_ui or not self.crs_utm.isChecked() or self.utm_zone_input.value() <= 0:
             return
-        self._translate_inputs("utm", "utm")
+
+        new_zone = self.utm_zone_input.value()
+        old_zone = self._active_utm_zone
+        if old_zone is None:
+            old_zone = new_zone
+        if old_zone == new_zone:
+            self._active_utm_zone = new_zone
+            return
+
+        try:
+            if self.mode_corners.isChecked():
+                bbox = BoundingBox.from_corners(
+                    self.lat1_input.value(), self.lon1_input.value(),
+                    self.lat2_input.value(), self.lon2_input.value(),
+                    crs="utm", utm_zone=old_zone,
+                )
+                self._apply_bbox_to_inputs(bbox, "utm")
+            else:
+                bbox = BoundingBox.from_centroid_and_size(
+                    self.clat_input.value(), self.clon_input.value(),
+                    self.width_input.value(), self.height_input.value(),
+                    crs="utm", utm_zone=old_zone,
+                )
+                self._apply_centroid_from_bbox(bbox, "utm")
+        except Exception:
+            return
+
+        self._active_utm_zone = new_zone
+        self._update_info()
+
+    def _selected_utm_zone(self) -> int | None:
+        """Return explicit zone selection, or None for auto mode."""
+        value = self.utm_zone_input.value()
+        return value if value > 0 else None
+
+    def _input_utm_zone(self) -> int | None:
+        """Zone to interpret current UTM inputs with."""
+        return self._selected_utm_zone() or self._active_utm_zone
 
     def _current_crs(self) -> str:
         return "latlong" if self.crs_latlong.isChecked() else "utm"
@@ -505,7 +533,7 @@ class BboxInputWidget(QWidget):
     def _translate_inputs(self, old_crs: str, new_crs: str):
         """Translate currently entered coordinates between CRS modes while preserving bbox."""
         try:
-            utm_zone = self.utm_zone_input.value() if self.utm_zone_input.value() > 0 else None
+            utm_zone = self._input_utm_zone()
 
             if self.mode_corners.isChecked():
                 bbox = BoundingBox.from_corners(
@@ -525,15 +553,27 @@ class BboxInputWidget(QWidget):
             return
 
     def _apply_bbox_to_inputs(self, bbox: BoundingBox, crs: str):
-        utm_zone = self.utm_zone_input.value() if self.utm_zone_input.value() > 0 else None
+        utm_zone = self._selected_utm_zone()
         if crs == "latlong":
             self._set_spin_value(self.lat1_input, bbox.max_lat)
             self._set_spin_value(self.lon1_input, bbox.min_lon)
             self._set_spin_value(self.lat2_input, bbox.min_lat)
             self._set_spin_value(self.lon2_input, bbox.max_lon)
+            self._active_utm_zone = bbox.get_utm_zone()
             return
 
         zone = utm_zone or bbox.get_utm_zone()
+        self._active_utm_zone = zone
+
+        # In UTM input mode, coordinates require a concrete zone. Populate auto mode
+        # with detected zone once we have enough information from bbox.
+        if self.utm_zone_input.value() <= 0:
+            self._updating_ui = True
+            try:
+                self.utm_zone_input.setValue(zone)
+            finally:
+                self._updating_ui = False
+
         centroid_lat = (bbox.min_lat + bbox.max_lat) / 2
         epsg = 32600 + zone if centroid_lat >= 0 else 32700 + zone
         transformer = Transformer.from_crs("EPSG:4326", CRS.from_epsg(epsg), always_xy=True)
@@ -554,9 +594,19 @@ class BboxInputWidget(QWidget):
         if crs == "latlong":
             self._set_spin_value(self.clat_input, centroid_lat)
             self._set_spin_value(self.clon_input, centroid_lon)
+            self._active_utm_zone = bbox.get_utm_zone()
             return
 
-        utm_zone = self.utm_zone_input.value() if self.utm_zone_input.value() > 0 else bbox.get_utm_zone()
+        utm_zone = self._selected_utm_zone() or bbox.get_utm_zone()
+        self._active_utm_zone = utm_zone
+
+        if self.utm_zone_input.value() <= 0:
+            self._updating_ui = True
+            try:
+                self.utm_zone_input.setValue(utm_zone)
+            finally:
+                self._updating_ui = False
+
         epsg = 32600 + utm_zone if centroid_lat >= 0 else 32700 + utm_zone
         transformer = Transformer.from_crs("EPSG:4326", CRS.from_epsg(epsg), always_xy=True)
         x, y = transformer.transform(centroid_lon, centroid_lat)
@@ -600,7 +650,7 @@ class BboxInputWidget(QWidget):
     def get_bbox(self) -> BoundingBox:
         """Get BoundingBox from current input."""
         crs = "latlong" if self.crs_latlong.isChecked() else "utm"
-        utm_zone = self.utm_zone_input.value() if self.utm_zone_input.value() > 0 else None
+        utm_zone = self._input_utm_zone()
         
         if self.mode_corners.isChecked():
             return BoundingBox.from_corners(
