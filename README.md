@@ -1,6 +1,4 @@
-# [PROJECT_NAME]
-
-<!-- TODO: Replace [PROJECT_NAME] with your final project name -->
+# RegionDownloadGIS
 
 *Because hand-assembling GIS layers from six sources is a great way to spend a weekend you never get back.*
 
@@ -17,8 +15,6 @@ Working with regional GIS data usually means juggling terrain, vector layers, co
 This project wraps that workflow into a guided desktop wizard: define your area, pick layers, run download and processing, inspect results, and export deliverables for QGIS or downstream tools. It keeps practical defaults while still giving you control over CRS and output formats.
 
 Repository: https://github.com/AdamMoses-GitHub/RegionDownloadGIS
-
-<!-- TODO: Replace [GITHUB_URL] with the repository URL -->
 
 ## What It Does
 
