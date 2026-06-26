@@ -9,6 +9,7 @@ def main():
     """Launch the application."""
     app = create_app()
     wizard = MapDownloaderWizard()
+    wizard.setCurrentId(0)
     wizard.show()
     sys.exit(app.exec())
 

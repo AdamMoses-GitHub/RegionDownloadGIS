@@ -1,6 +1,6 @@
 """Main QWizard implementation."""
 
-from PySide6.QtWidgets import QWizard, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
+from PySide6.QtWidgets import QWizard, QMessageBox
 from PySide6.QtCore import Qt
 from map_downloader.gui.pages.p1_bbox import BboxPage
 from map_downloader.gui.pages.p2_layers import LayersPage
@@ -19,6 +19,17 @@ class MapDownloaderWizard(QWizard):
         super().__init__(parent)
         self._last_page_id = 0
         self._run_status = "Idle"
+        self._project_file_path: str | None = None
+
+        # Use standard top-level window controls (minimize/maximize/close) on Windows.
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         
         self._update_window_title(0)
         self.setGeometry(100, 100, 900, 700)
@@ -46,10 +57,10 @@ class MapDownloaderWizard(QWizard):
         self.button(QWizard.WizardButton.FinishButton).clicked.connect(self._on_finish)
         
         # Customize buttons
-        self.setButtonText(QWizard.WizardButton.BackButton, "← Back")
-        self.setButtonText(QWizard.WizardButton.NextButton, "Next →")
+        self.setButtonText(QWizard.WizardButton.BackButton, "Previous")
+        self.setButtonText(QWizard.WizardButton.NextButton, "Next")
         self.setButtonText(QWizard.WizardButton.FinishButton, "Finish")
-        self.setButtonText(QWizard.WizardButton.CancelButton, "Cancel")
+        self.setButtonText(QWizard.WizardButton.CancelButton, "Quit Application")
         
         # Add toolbar with Save/Load
         self._create_toolbar()
@@ -120,16 +131,118 @@ class MapDownloaderWizard(QWizard):
     
     def _on_finish(self):
         """Handle finish button."""
-        self._sync_project_from_page(self.currentId())
-        
-        # Save project
         try:
-            output_root = self.project.resolve_output_root(force_refresh=False)
-            project_stem = self.project.sanitize_name(self.project.name)
-            project_file = output_root / f"{project_stem}.r3d.json"
-            project_file.parent.mkdir(parents=True, exist_ok=True)
-            self.project.save(str(project_file))
+            self.save_project_to_default_location()
         except Exception as e:
             print(f"Error saving project: {e}")
         
         self.accept()
+
+    def _confirm_quit(self) -> bool:
+        """Return True if user confirms quitting the application."""
+        reply = QMessageBox.question(
+            self,
+            "Quit Application",
+            "Quit Region3D Map Data Downloader? Unsaved changes may be lost.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def reject(self):
+        """Intercept cancel/close to confirm quitting."""
+        if self._confirm_quit():
+            super().reject()
+
+    def save_project_to_default_location(self) -> str:
+        """Sync current page and save project into output root with sanitized name."""
+        self._sync_project_from_page(self.currentId())
+        output_root = self.project.resolve_output_root(force_refresh=False)
+        project_stem = self.project.sanitize_name(self.project.name)
+        project_file = output_root / f"{project_stem}.r3d.json"
+        project_file.parent.mkdir(parents=True, exist_ok=True)
+        self.project.save(str(project_file))
+        self._project_file_path = str(project_file)
+        return str(project_file)
+
+    def save_project_as(self, path: str) -> str:
+        """Sync current page and save project to explicit path."""
+        self._sync_project_from_page(self.currentId())
+        path_obj = Path(path)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
+        self.project.save(str(path_obj))
+        self._project_file_path = str(path_obj)
+        return str(path_obj)
+
+    def load_project_from_file(self, path: str):
+        """Load project from .r3d.json and refresh UI page state."""
+        loaded = Project.load(path)
+        self.project = loaded
+        self._project_file_path = str(path)
+        self._apply_project_to_pages()
+
+    def current_project_file_path(self) -> str | None:
+        """Return last explicit project file path if known."""
+        return self._project_file_path
+
+    def reset_new_project(self):
+        """Reset wizard to a new blank project and refresh page state."""
+        self.project = Project()
+        self._project_file_path = None
+        self._apply_project_to_pages()
+        self.setCurrentId(0)
+
+    def _apply_project_to_pages(self):
+        """Push current project values into page widgets."""
+        bbox = self.project.get_bbox()
+        if bbox is not None:
+            crs = "utm" if bbox.has_strict_utm_bounds() else "latlong"
+            self.bbox_page.bbox_widget.mode_corners.setChecked(True)
+            self.bbox_page.bbox_widget.crs_utm.setChecked(crs == "utm")
+            self.bbox_page.bbox_widget.crs_latlong.setChecked(crs != "utm")
+            if crs == "utm":
+                min_e, min_n, max_e, max_n = bbox.get_utm_bounds()
+                zone = bbox.get_utm_zone()
+                self.bbox_page.bbox_widget.utm_zone_input.setValue(zone)
+                self.bbox_page.bbox_widget.lat1_input.setValue(max_n)
+                self.bbox_page.bbox_widget.lon1_input.setValue(min_e)
+                self.bbox_page.bbox_widget.lat2_input.setValue(min_n)
+                self.bbox_page.bbox_widget.lon2_input.setValue(max_e)
+            else:
+                self.bbox_page.bbox_widget.lat1_input.setValue(bbox.max_lat)
+                self.bbox_page.bbox_widget.lon1_input.setValue(bbox.min_lon)
+                self.bbox_page.bbox_widget.lat2_input.setValue(bbox.min_lat)
+                self.bbox_page.bbox_widget.lon2_input.setValue(bbox.max_lon)
+
+        for layer_name, card in self.layers_page.layer_cards.items():
+            cfg = self.project.layers.get(layer_name)
+            if cfg is None:
+                continue
+            card.config = cfg
+            card.enable_checkbox.setChecked(cfg.enabled)
+            if layer_name == "terrain":
+                idx = {"3dep": 0, "srtm": 1, "auto": 2}.get(cfg.terrain_source, 2)
+                card.source_combo.setCurrentIndex(idx)
+            elif layer_name == "buildings":
+                idx = {"osm": 0, "microsoft": 1, "merged": 2}.get(cfg.building_source, 2)
+                card.source_combo.setCurrentIndex(idx)
+                hidx = {"flat": 0, "estimate": 1, "mean": 2}.get(cfg.building_height_mode.value, 1)
+                card.height_combo.setCurrentIndex(hidx)
+            elif layer_name == "landuse":
+                card.raster_check.setChecked(cfg.landuse_raster)
+                card.vector_check.setChecked(cfg.landuse_vector)
+            elif layer_name == "water":
+                card.vector_check.setChecked(cfg.water_vector)
+            elif layer_name == "reference":
+                card.zoom_spin.setValue(cfg.reference_zoom if cfg.reference_zoom is not None else 0)
+
+        self.output_page.name_input.setText(self.project.name)
+        self.output_page.folder_input.setText(self.project.output_folder)
+        self.output_page.resolution_spin.setValue(float(self.project.resolution_m))
+        mode = str(self.project.timestamp_mode or "").lower().strip()
+        self.output_page.timestamp_none_radio.setChecked(mode == TimestampMode.NONE.value)
+        self.output_page.timestamp_prepend_radio.setChecked(mode == TimestampMode.PREPEND.value)
+        self.output_page.timestamp_append_radio.setChecked(mode == TimestampMode.APPEND.value)
+        utm_override = self.project.utm_zone_override if self.project.utm_zone_override is not None else 0
+        self.output_page.utm_spin.setValue(int(utm_override))
+        self.output_page._update_resolved_folder_preview()
