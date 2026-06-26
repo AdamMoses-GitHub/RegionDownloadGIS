@@ -38,7 +38,7 @@ Repository: https://github.com/AdamMoses-GitHub/RegionDownloadGIS
 Full setup and workflow guide: [INSTALL_AND_USAGE.md](INSTALL_AND_USAGE.md)
 
 ```bash
-git clone [GITHUB_URL]
+git clone https://github.com/AdamMoses-GitHub/RegionDownloadGIS
 cd RegionDownloadGIS
 conda env create -f environment.yml
 conda activate region3d
