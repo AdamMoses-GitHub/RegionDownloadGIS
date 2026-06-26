@@ -5,8 +5,30 @@ from pathlib import Path
 import rasterio
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 import geopandas as gpd
+from shapely.validation import make_valid
 
 from map_downloader.core.bbox import BoundingBox
+
+
+def _repair_geometry(geom):
+    """Return a valid geometry when possible, preserving empty/None inputs."""
+    if geom is None or geom.is_empty or geom.is_valid:
+        return geom
+
+    repaired = None
+    try:
+        repaired = make_valid(geom)
+    except Exception:
+        repaired = None
+
+    if repaired is None or repaired.is_empty:
+        if geom.geom_type in ("Polygon", "MultiPolygon"):
+            try:
+                repaired = geom.buffer(0)
+            except Exception:
+                repaired = None
+
+    return repaired if repaired is not None else geom
 
 
 def reproject_raster(
@@ -99,11 +121,56 @@ def reproject_vector(
 
         if clip_bbox is not None:
             clip_geom = clip_bbox.to_polygon_in_crs(target_crs)
-            gdf_reprojected = gdf_reprojected[gdf_reprojected.geometry.intersects(clip_geom)].copy()
-            gdf_reprojected.geometry = gdf_reprojected.geometry.intersection(clip_geom)
-            gdf_reprojected = gdf_reprojected[
-                gdf_reprojected.geometry.notna() & (~gdf_reprojected.geometry.is_empty)
-            ].copy()
+            clip_geom = _repair_geometry(clip_geom)
+            clipped_rows = []
+            for _, row in gdf_reprojected.iterrows():
+                geom = _repair_geometry(row.geometry)
+                if geom is None or geom.is_empty:
+                    continue
+                try:
+                    if not geom.intersects(clip_geom):
+                        continue
+                except Exception:
+                    geom = _repair_geometry(geom)
+                    if geom is None or geom.is_empty:
+                        continue
+                    if not geom.intersects(clip_geom):
+                        continue
+
+                try:
+                    clipped = geom.intersection(clip_geom)
+                except Exception:
+                    repaired = _repair_geometry(geom)
+                    if repaired is None or repaired.is_empty:
+                        continue
+                    try:
+                        clipped = repaired.intersection(clip_geom)
+                    except Exception:
+                        continue
+
+                clipped = _repair_geometry(clipped)
+                if clipped is None or clipped.is_empty:
+                    continue
+
+                new_row = row.copy()
+                new_row.geometry = clipped
+                clipped_rows.append(new_row)
+
+            gdf_reprojected = gpd.GeoDataFrame(clipped_rows, columns=gdf_reprojected.columns, crs=gdf_reprojected.crs)
+
+        else:
+            repaired_geoms = []
+            for geom in gdf_reprojected.geometry:
+                geom = _repair_geometry(geom)
+                if geom is None or geom.is_empty:
+                    continue
+                repaired_geoms.append(geom)
+
+            if len(repaired_geoms) != len(gdf_reprojected):
+                gdf_reprojected = gdf_reprojected[gdf_reprojected.geometry.notna()].copy()
+            gdf_reprojected.geometry = [
+                _repair_geometry(geom) for geom in gdf_reprojected.geometry
+            ]
         
         # Determine driver from format
         driver_map = {

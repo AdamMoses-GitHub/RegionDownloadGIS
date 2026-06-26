@@ -8,7 +8,7 @@
 ![Language](https://img.shields.io/badge/language-Python%203.12-3776AB)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-![App Screenshot](INSERT_IMAGE_URL_HERE)
+![App Screenshot](screenshot.jpg)
 
 ## About
 
@@ -16,7 +16,7 @@ Working with regional GIS data usually means juggling terrain, vector layers, co
 
 This project wraps that workflow into a guided desktop wizard: define your area, pick layers, run download and processing, inspect results, and export deliverables for QGIS or downstream tools. It keeps practical defaults while still giving you control over CRS and output formats.
 
-Repository: [GITHUB_URL]
+Repository: https://github.com/AdamMoses-GitHub/RegionDownloadGIS
 
 <!-- TODO: Replace [GITHUB_URL] with the repository URL -->
 

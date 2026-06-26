@@ -205,6 +205,32 @@ class HardeningTests(unittest.TestCase):
             self.assertGreaterEqual(miny, 4500000.0)
             self.assertLessEqual(maxy, 4501000.0)
 
+    def test_reproject_vector_repairs_invalid_geometry_before_clipping(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            src_path = root / "invalid.geojson"
+            out_path = root / "repaired.geojson"
+            bbox = BoundingBox(-74.02, 40.69, -73.99, 40.72)
+
+            gdf = gpd.GeoDataFrame(
+                {"name": ["bowtie"]},
+                geometry=gpd.GeoSeries.from_wkt(
+                    [
+                        "POLYGON ((-74.0100 40.7000, -74.0000 40.7100, -74.0100 40.7100, -74.0000 40.7000, -74.0100 40.7000))"
+                    ]
+                ),
+                crs="EPSG:4326",
+            )
+            gdf.to_file(src_path, driver="GeoJSON")
+
+            self.assertTrue(reproject_vector(src_path, out_path, "EPSG:32618", "GeoJSON", clip_bbox=bbox))
+
+            out_gdf = gpd.read_file(out_path)
+            self.assertEqual(len(out_gdf), 1)
+            self.assertEqual(out_gdf.iloc[0]["name"], "bowtie")
+            self.assertFalse(out_gdf.geometry.iloc[0].is_empty)
+            self.assertTrue(out_gdf.geometry.iloc[0].is_valid)
+
     def test_downloader_cache_key_changes_with_options(self):
         with tempfile.TemporaryDirectory() as td:
             cache = CacheManager(td)
